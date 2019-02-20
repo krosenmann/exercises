@@ -1,0 +1,270 @@
+#+OPTIONS: html-link-use-abs-url:nil html-postamble:auto
+#+OPTIONS: html-preamble:t html-scripts:t html-style:t
+#+OPTIONS: html5-fancy:nil tex:t
+#+HTML_DOCTYPE: xhtml-strict
+#+HTML_CONTAINER: div
+#+DESCRIPTION:
+#+KEYWORDS: 
+#+CREATOR: <a href="https://www.gnu.org/software/emacs/">Emacs</a> 27.0.50 (<a href="https://orgmode.org">Org</a> mode 9.1.9)
+#+LATEX_HEADER:
+
+#+OPTIONS: ':nil *:t -:t ::t <:t H:3 \n:nil ^:t arch:headline
+#+OPTIONS: author:t broken-links:nil c:nil creator:nil
+#+OPTIONS: d:(not "LOGBOOK") date:t e:t email:nil f:t inline:t num:t
+#+OPTIONS: p:nil pri:nil prop:nil stat:t tags:t tasks:t tex:t
+#+OPTIONS: timestamp:t title:t toc:nil todo:t |:t
+#+TITLE: Микропарсер данных из AppStore
+#+DATE: <2019-02-20 Ср>
+#+AUTHOR: Roman Zayrullin
+#+EMAIL: krosenmann@gmail.com
+#+LANGUAGE: ru
+#+SELECT_TAGS: export
+#+EXCLUDE_TAGS: noexport
+* Задача
+  Написать периодическое скачивание данных о приложении в App
+  Store. Параметры на входе: по случайная пара (storeid, страна) (страны
+  только две). 
+  Полученные данные передать в удаленное хранилище данных и сохранить
+  в наиболее подходящем виде для чтобы в дальнейшем можно было с
+  минимальным пробегом по хранилищу получать историю по заданному
+  аппу. 
+  Реализация получения истории не требуется.
+  #+name: Данные для запроса:
+  #+BEGIN_EXAMPLE
+    country_ids = {
+       'RU': '143469-16',
+       'US': '143441-1',
+    }
+    url1 = https://itunes.apple.com/us/app/facebook/id284882215
+    url2 = https://itunes.apple.com/ru/app/f8/id853467066
+  #+END_EXAMPLE
+
+  #+BEGIN_SRC python :noweb-ref Параметры запроса
+    f'https://itunes.apple.com/us/app/id{app_id}',
+    headers={'User-Agent': 'AppStore/2.0 iOS/8.4 model/iPhone4,1 build/12H143 (6; dt:73)',
+	     'X-Apple-Store-Front': f'{country_id},29 t:native',}
+  #+END_SRC
+
+  Предполагается, что поиск  по выкаченным данным производится в
+  разрезе приложение\страна за период времени.
+* Способ решения
+  Парсер - небольшой скрипт, которые выгружает данные по пинку из App
+  Store и отправляет их в хранилище. 
+  #+NAME: parser
+  #+BEGIN_SRC python :noweb no-export :tangle parser.py :shebang #!/usr/bin/env python3.6
+    <<imports>>
+
+
+    <<http_load>>
+
+
+    <<предподготовка>>
+
+
+    <<отправка>>
+
+    def main():
+	from datetime import datetime
+	dbconf = configure()
+	parser_args = parse_arguments()
+	fromc, content = request(**parser_args)
+	load_date = datetime.now().isoformat()
+	if fromc:
+	    return
+	if not check_changes(content, **parser_args):
+	    return
+	write_data_to_db(load_date, data_blob=content, **parser_args)
+	return
+
+    if __name__ == '__main__':
+	main()
+  #+END_SRC
+** Загрузка
+   Пинаем AppStore GET-запросом. 
+   Для того, чтобы работать с http-кэшем (снижаем затраты на сеть), воспользуемся httplib2.
+   #+BEGIN_SRC python :noweb-ref imports
+     import httplib2
+   #+END_SRC
+
+   #+BEGIN_SRC python :noweb-ref http_load :noweb yes
+     ht = httplib2.Http('.cache')
+
+
+     def request(app_id, country_id):
+	 response, content = ht.request(
+	     <<Параметры запроса>>
+	 )
+	 return response.fromcache, content
+   #+END_SRC
+** Предподготовка
+   Данные пишем, избегая дублирования. В случае, если с последней
+   выгрузки данные не изменились, не делаем ничего.
+   Проверку измененности проводим на стороне парсера, для этого
+   парсеры подключаются к собственному кэшу, в котором ключ: ~app_id +
+   country_id~, а значение: хэш тела последнего ответа.
+   #+BEGIN_SRC python :noweb-ref imports
+     import hashlib
+   #+END_SRC
+
+   #+BEGIN_SRC python :noweb-ref предподготовка :noweb yes
+     def check_changes(resp_body, app_id, country_id):
+	 hashed_body = hashlib.md5(resp_body)
+	 message = hashed_body.hexdigest()
+	 key = f'{app_id}+{counry_id}'
+	 <<чтение из кэша>>
+	 if last_info_hash == message:
+	     return
+	 <<запись в кэш>>
+	 return hashed_body.hexdigest()
+   #+END_SRC
+** Операции с локальным кэшем
+   Для k\v кеша я взял redis. 
+   #+BEGIN_SRC python :noweb-ref imports
+     import redis
+   #+END_SRC
+
+   #+BEGIN_SRC python :noweb-ref чтение из кэша
+     r = redis.Redis(host='localhost', port=6379, db=0)
+     last_info_hash = r.get(key)
+   #+END_SRC
+
+   #+BEGIN_SRC python :noweb-ref запись в кэш
+     r.set(key, message)
+   #+END_SRC
+
+** Форма обработанных данных
+   Информации по теме и времени у меня достаточно мало, чтобы
+   корректно ограничить и переформулировать выдачу, поэтому использую
+   костыльную схему: Параметры выгрузки, дата выгрузки, блоб. В таком
+   случае, можно получать историю версий информации по приложений за
+   период времени, но в то же время почти нет возможности эффективно
+   взаимодействовать с информацией из блоба: эта задача ложится на
+   клиентское приложение (по отношению к хранилищу).
+   #+BEGIN_SRC python :noweb-ref предподготовка :noweb yes
+     <<конфигурация>>
+
+
+     <<db_tech_things>>
+
+
+     class AppInfo(Base):
+	 __tablename__ = 'app_info'
+
+	 id = Column(Integer, primary_key=True)
+	 country = Column(String)
+	 app = Column(String)
+	 data = Columnt(Text)
+
+
+     def write_data_to_db(load_date, country_id, app_id, data_blob):
+	 with session_scope() as session:
+	     app_info=AppInfo(load_date=load_date, 
+			      country=contry_id,
+			      app=app_id,
+			      data=data_blob)
+	     session.add(app_info)
+	     session.commit()
+   #+END_SRC
+    
+*** Соединение и запись данных
+    
+    #+BEGIN_SRC python :noweb-ref imports
+      from sqlalchemy import create_engine, Column, Integer, Text
+      from sqlalchemy.ext.declarative import declarative_base
+      from sqlalchemy.orm import sessionmaker
+    #+END_SRC
+
+    #+BEGIN_SRC python :noweb-ref db_tech_things
+      from contextlib import contextmanager
+
+      
+      Base = declarative_base()
+      conf = configure()
+      engine = create_engine(f"postgres://{conf['user']}:{conf['password']}@{conf['host']}:{conf['port']}/testdb")
+      Session = sessionmaker(bind=engine)
+
+
+      @contextmanager
+      def session_scope():
+	  session = Session()
+	  try:
+	      yield session
+	      session.commit()
+	  except:
+	      session.rollback()
+	      raise
+	  finally:
+	      session.close()
+
+	      
+    #+END_SRC
+* Требования и сроки
+  По организации взаимодействия никак тебя не ограничиваем, но следует
+  предусмотреть возможность экспоненциального роста количества
+  парсеров. 
+* Пользовательский интерфейс
+  В парсере имеется 2 интерфейса: конфигурационный файл и параметры
+  командной строки.
+  Конфигурационный файл содержит параметры для подключения БД
+  #+BEGIN_EXAMPLE
+    [postgres]
+    user = root
+    password = barakaraba
+    host = localhost
+    port = 5432
+  #+END_EXAMPLE
+
+
+  #+BEGIN_SRC python :noweb-ref конфигурация
+    def configure(conf='parser.conf'):
+	config = configparser.ConfigParser()
+	config.read(conf)
+	return {k: v for k, v in config['postgres'].items()}
+
+
+  #+END_SRC
+
+  В параметрах командной строки указывается ~app_id~ и ~country_id~,
+  по которым будут скачиваться данные.
+  #+BEGIN_SRC python :noweb-ref конфигурация
+    def parse_arguments():
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--app_id", help="AppStore application ID",
+			    default='284882215')
+	parser.add_argument("--country_id", help="AppStopre country ID",
+			    default='143469-16')
+	args = parser.parse_args()
+	return args.__dict__
+	
+
+  #+END_SRC
+* Развертывание
+  :PROPERTIES:
+  :header-args: :results pp
+  :header-args+: :exports code
+  :END:
+  При работе тестировал код локально, и не заливал на сервера.
+  Идея простейшая: базу -> на сервер "Хранилище", приложение (с
+  редисом) -> на сервер приложения. 
+  Деплой, как наименнее приоритетную, задачу я отложил на самый конец.
+  Из работы с серверами только проверил их доступность.
+  
+** Приложение
+   :PROPERTIES:
+   :header-args+: :session parser
+   :header-args+: :var host=; user=; pass=
+   :END:
+   Сервер парсера
+   #+BEGIN_SRC shell :results drawer
+   sshpass -p $pass ssh $user@$host
+   #+END_SRC
+
+** Хранилище
+   :PROPERTIES:
+   :header-args+: :session storage
+   :header-args+: :var host=; user=; pass=
+   :END:
+   Сервер хранилища
+   #+BEGIN_SRC shell :results silent
+     sshpass -p $pass ssh $user@$host
+   #+END_SRC
