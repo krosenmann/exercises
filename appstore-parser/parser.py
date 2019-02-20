@@ -2,7 +2,7 @@
 import httplib2
 import hashlib
 import redis
-from sqlalchemy import create_engine, Column, Integer, Text
+from sqlalchemy import create_engine, Column, Integer, Text, String, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -19,10 +19,10 @@ def request(app_id, country_id):
     return response.fromcache, content
 
 
-def check_changes(resp_body, app_id, country_id):
+def check_changes(load_date, resp_body, app_id, country_id):
     hashed_body = hashlib.md5(resp_body)
     message = hashed_body.hexdigest()
-    key = f'{app_id}+{counry_id}'
+    key = f'{load_date}+{app_id}+{counry_id}'
     r = redis.Redis(host='localhost', port=6379, db=0)
     last_info_hash = r.get(key)
     if last_info_hash == message:
@@ -75,6 +75,7 @@ class AppInfo(Base):
     __tablename__ = 'app_info'
 
     id = Column(Integer, primary_key=True)
+    load_date = Column(DateTime)
     country = Column(String)
     app = Column(String)
     data = Columnt(Text)
@@ -97,10 +98,10 @@ def main():
     dbconf = configure()
     parser_args = parse_arguments()
     fromc, content = request(**parser_args)
-    load_date = datetime.now().isoformat()
+    load_date = datetime.now()
     if fromc:
 	return
-    if not check_changes(content, **parser_args):
+    if not check_changes(load_date.isoformat(), content, **parser_args):
 	return
     write_data_to_db(load_date, data_blob=content, **parser_args)
     return
